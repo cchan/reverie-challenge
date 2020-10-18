@@ -1,0 +1,11 @@
+name: myenv
+channels:
+  - rdkit
+dependencies:
+  - python=3.6
+  - rdkit=2020.03.1
+  - jupyterlab
+  - numpy
+  - flask
+  - pip:
+    - streamlit
