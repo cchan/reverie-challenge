@@ -1,3 +1,6 @@
 __pycache__
 database.csv
 database_fingerprints.npy
+.ipynb_checkpoints
+*.c
+*.so
