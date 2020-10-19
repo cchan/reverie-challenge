@@ -4,3 +4,4 @@ database_fingerprints.npy
 .ipynb_checkpoints
 *.c
 *.so
+*.o

@@ -1,7 +1,7 @@
 import numpy as np
 cimport numpy as np
 cimport cython
-from libc.stdint cimport uint32_t, uint8_t, int32_t, uint64_t
+from libc.stdint cimport uint32_t, uint8_t, int32_t, uint64_t, int64_t
 
 cdef extern int __builtin_popcount(unsigned int) nogil
 
@@ -80,13 +80,25 @@ cdef extern from "immintrin.h":
     __int64 _mm_popcnt_u64(__int64) nogil
 @cython.boundscheck(False)
 @cython.wraparound(False)
-cdef void _fused_popcount64_bitwise_and(uint64_t[:] query_packed, uint64_t[:] fingerprints_packed, uint32_t[:] counts) nogil:
+cdef void _fused_popcount64_bitwise_and(uint64_t[:] query_packed, uint64_t[:] fingerprints_packed, int32_t[:] counts) nogil: #, int64_t[:] counts) nogil:
+    # cdef int i
+    # cdef int j
+    # for i in xrange(fingerprints_packed.shape[0]//32):
+    #     for j in xrange(32):
+    #         counts[i] += _mm_popcnt_u64(fingerprints_packed[i*32+j] & query_packed[j])
     cdef int i
-    for i in xrange(fingerprints_packed.shape[0]):
-        counts[i>>5] += _mm_popcnt_u64(fingerprints_packed[i] & query_packed[i & 31])
+    cdef int j
+    cdef int32_t count
+    cdef uint64_t *fingerprints_packed_curr
+    for i in xrange(fingerprints_packed.shape[0]//32):
+        count = 0
+        fingerprints_packed_curr = &fingerprints_packed[i<<5]
+        for j in xrange(32):
+            count += _mm_popcnt_u64(fingerprints_packed_curr[j] & query_packed[j])
+        counts[i] = count
 
 def fused_popcount64_bitwise_and(query_packed, fingerprints_packed):
-    counts = np.zeros(fingerprints_packed.shape[0], dtype=np.uint32)
+    counts = np.empty(fingerprints_packed.shape[0]//32, dtype=np.int32)
     _fused_popcount64_bitwise_and(query_packed, fingerprints_packed, counts)
     return counts
 
@@ -161,3 +173,190 @@ def fused_avx2_emulated_popcount(query_packed, fingerprints_packed):
     counts = np.zeros(fingerprints_packed.shape[0], dtype=np.uint32)
     _fused_avx2_emulated_popcount(query_packed, fingerprints_packed, counts)
     return counts
+
+
+
+
+cdef extern from "immintrin.h":
+    cdef __m256i _mm256_shuffle_epi8(__m256i, __m256i) nogil
+    cdef __m256i _mm256_add_epi8(__m256i, __m256i) nogil
+    cdef __m256i _mm256_srli_epi16(__m256i, int) nogil
+    cdef __m256i _mm256_set1_epi8(char) nogil
+    cdef __m256i _mm256_setr_epi8(char, char, char, char, char, char, char, char, char, char, char, char, char, char, char, char,
+                                  char, char, char, char, char, char, char, char, char, char, char, char, char, char, char, char) nogil
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef void _fused_popcount64_bitwise_and_avx(uint64_t[:] query_packed, uint64_t[:] fingerprints_packed, int32_t[:] counts) nogil: #, int64_t[:] counts) nogil:
+    # cdef int i
+    # cdef int j
+    # for i in xrange(fingerprints_packed.shape[0]//32):
+    #     for j in xrange(32):
+    #         counts[i] += _mm_popcnt_u64(fingerprints_packed[i*32+j] & query_packed[j])
+    cdef int i
+    cdef int j
+    cdef int32_t count
+    cdef uint64_t *fingerprints_packed_curr
+    cdef __m256i vec
+    cdef __m256i acc
+    cdef __m256i lookup = _mm256_setr_epi8(
+        0, 1, 1, 2,
+        1, 2, 2, 3,
+        1, 2, 2, 3,
+        2, 3, 3, 4,
+
+        0, 1, 1, 2,
+        1, 2, 2, 3,
+        1, 2, 2, 3,
+        2, 3, 3, 4
+    )
+    cdef __m256i low_mask = _mm256_set1_epi8(0x0f)
+    cdef __m256i local
+    cdef __m256i lo
+    cdef __m256i hi
+    for i in xrange(fingerprints_packed.shape[0]//32):
+        local = _mm256_setzero_si256()
+        fingerprints_packed_curr = &fingerprints_packed[i<<5]
+        for j in xrange(0, 32, 4):
+            vec = _mm256_and_si256(_mm256_loadu_si256(<const __m256i*>&fingerprints_packed_curr[j]), _mm256_loadu_si256(<const __m256i*>&query_packed[j]))
+            lo = _mm256_and_si256(vec, low_mask)
+            hi = _mm256_and_si256(_mm256_srli_epi16(vec, 4), low_mask)
+            local = _mm256_add_epi8(local, _mm256_shuffle_epi8(lookup, lo))
+            local = _mm256_add_epi8(local, _mm256_shuffle_epi8(lookup, hi))
+        acc = _mm256_sad_epu8(local, _mm256_setzero_si256())
+        counts[i] = _mm256_extract_epi64(acc, 0) + _mm256_extract_epi64(acc, 1) + _mm256_extract_epi64(acc, 2) + _mm256_extract_epi64(acc, 3)
+
+def fused_popcount64_bitwise_and_avx(query_packed, fingerprints_packed):
+    counts = np.empty(fingerprints_packed.shape[0]//32, dtype=np.int32)
+    _fused_popcount64_bitwise_and_avx(query_packed, fingerprints_packed, counts)
+    return counts
+
+
+
+cdef extern from "<algorithm>" namespace "std":
+    Iter push_heap[Iter](Iter first, Iter last) nogil
+    Iter pop_heap[Iter](Iter first, Iter last) nogil
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef void _fused_popcount64_bitwise_and_avx_topk(uint64_t[:] query_packed, uint64_t[:] fingerprints_packed, int64_t[:] topk) nogil:
+    cdef int i
+    cdef int j
+    cdef int k = len(topk)
+    cdef int64_t count
+    cdef uint64_t *fingerprints_packed_curr
+    cdef int64_t heapentry
+    cdef __m256i vec
+    cdef __m256i acc
+    cdef __m256i lookup = _mm256_setr_epi8(
+        0, 1, 1, 2,
+        1, 2, 2, 3,
+        1, 2, 2, 3,
+        2, 3, 3, 4,
+
+        0, 1, 1, 2,
+        1, 2, 2, 3,
+        1, 2, 2, 3,
+        2, 3, 3, 4
+    )
+    cdef __m256i low_mask = _mm256_set1_epi8(0x0f)
+    cdef __m256i local
+    cdef __m256i lo
+    cdef __m256i hi
+    for i in xrange(fingerprints_packed.shape[0]//(2048//64)):
+        local = _mm256_setzero_si256()
+        fingerprints_packed_curr = &fingerprints_packed[i<<5]
+        for j in xrange(0, 32, 4):
+            vec = _mm256_and_si256(_mm256_loadu_si256(<const __m256i*>&fingerprints_packed_curr[j]), _mm256_loadu_si256(<const __m256i*>&query_packed[j]))
+            lo = _mm256_and_si256(vec, low_mask)
+            hi = _mm256_and_si256(_mm256_srli_epi16(vec, 4), low_mask)
+            local = _mm256_add_epi8(local, _mm256_shuffle_epi8(lookup, lo))
+            local = _mm256_add_epi8(local, _mm256_shuffle_epi8(lookup, hi))
+        acc = _mm256_sad_epu8(local, _mm256_setzero_si256())
+        count = _mm256_extract_epi64(acc, 0) + _mm256_extract_epi64(acc, 1) + _mm256_extract_epi64(acc, 2) + _mm256_extract_epi64(acc, 3)
+        # Maintaining a min-heap in topk (negated max heap, since stl is default max heap)
+        heapentry = - ((count << 32) + i)
+        if topk[0] > heapentry:
+            pop_heap(&topk[0], &topk[k])
+            topk[k-1] = heapentry
+            push_heap(&topk[0], &topk[k])
+
+def fused_popcount64_bitwise_and_avx_topk(query_packed, fingerprints_packed, k):
+    topk = np.zeros(k, dtype=np.int64)
+    _fused_popcount64_bitwise_and_avx_topk(query_packed, fingerprints_packed, topk)
+    topk = -topk # negate it because minheap/maxheap stuff
+    return topk >> 32, topk & np.int64((1<<32) - 1) # counts, indexes
+
+
+
+
+cdef extern from "blosc.h":
+    int blosc_getitem(void*, int, int, void*) nogil
+    void blosc_cbuffer_sizes(void*, size_t*, size_t*, size_t*) nogil
+
+cdef int32_t BLOCK_SIZE_IN_ROWS = 128*32 # 1MB blocks
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef void _fused_popcount64_bitwise_and_avx_topk_blosc(uint64_t[:] query_packed, uint64_t[:] fingerprints_tmp_buf, const uint8_t[:] fingerprints_blosc_compressed, int64_t[:] topk, int n_fingerprints):
+    cdef:
+        int i
+        int j
+        int k = len(topk)
+        int64_t count
+        uint64_t *fingerprints_packed_curr
+        int n_fingerprints_curr
+        int z
+        int64_t heapentry
+        __m256i vec
+        __m256i acc
+        __m256i lookup = _mm256_setr_epi8(
+            0, 1, 1, 2,
+            1, 2, 2, 3,
+            1, 2, 2, 3,
+            2, 3, 3, 4,
+
+            0, 1, 1, 2,
+            1, 2, 2, 3,
+            1, 2, 2, 3,
+            2, 3, 3, 4
+        )
+        __m256i low_mask = _mm256_set1_epi8(0x0f)
+        __m256i local
+        __m256i lo
+        __m256i hi
+        size_t nbytes
+        size_t cbytes
+        size_t blocksize
+    blosc_cbuffer_sizes(&fingerprints_blosc_compressed[0], &nbytes, &cbytes, &blocksize)
+    print("INFO:", nbytes, cbytes, blocksize)
+    assert(blocksize == BLOCK_SIZE_IN_ROWS*2048//8)
+    for z in xrange(0, 32*n_fingerprints, 32*BLOCK_SIZE_IN_ROWS):
+        n_fingerprints_curr = blosc_getitem(&fingerprints_blosc_compressed[0], z, min(32*BLOCK_SIZE_IN_ROWS, 32*n_fingerprints-z), &fingerprints_tmp_buf[0])
+        if n_fingerprints_curr == 0:
+            print("Something went wrong")
+            break
+        for i in xrange(n_fingerprints_curr//(2048//64)): # (2048//64) has to evenly divide n_fingerprints and len(fingerprints_tmp_buf) == BLOCK_SIZE_IN_ROWS
+            local = _mm256_setzero_si256()
+            fingerprints_packed_curr = &fingerprints_tmp_buf[i<<5]
+            for j in xrange(0, 32, 4):
+                vec = _mm256_and_si256(_mm256_loadu_si256(<const __m256i*>&fingerprints_packed_curr[j]), _mm256_loadu_si256(<const __m256i*>&query_packed[j]))
+                lo = _mm256_and_si256(vec, low_mask)
+                hi = _mm256_and_si256(_mm256_srli_epi16(vec, 4), low_mask)
+                local = _mm256_add_epi8(local, _mm256_shuffle_epi8(lookup, lo))
+                local = _mm256_add_epi8(local, _mm256_shuffle_epi8(lookup, hi))
+            acc = _mm256_sad_epu8(local, _mm256_setzero_si256())
+            count = _mm256_extract_epi64(acc, 0) + _mm256_extract_epi64(acc, 1) + _mm256_extract_epi64(acc, 2) + _mm256_extract_epi64(acc, 3)
+            # Maintaining a min-heap in topk (negated max heap, since stl is default max heap)
+            heapentry = - ((count << 32) + (i + z//32))
+            if topk[0] > heapentry:
+                pop_heap(&topk[0], &topk[k])
+                topk[k-1] = heapentry
+                push_heap(&topk[0], &topk[k])
+
+def fused_popcount64_bitwise_and_avx_topk_blosc(query_packed, fingerprints_blosc_compressed, k, n_fingerprints):
+    topk = np.zeros(k, dtype=np.int64)
+    fingerprints_tmp_buf = np.empty(32*BLOCK_SIZE_IN_ROWS, dtype=np.uint64) # 128 => 64kB block
+    _fused_popcount64_bitwise_and_avx_topk_blosc(query_packed, fingerprints_tmp_buf, fingerprints_blosc_compressed, topk, n_fingerprints)
+    topk = -topk # negate it because minheap/maxheap stuff
+    return topk >> 32, topk & np.int64((1<<32) - 1) # counts, indexes
