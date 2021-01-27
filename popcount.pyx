@@ -296,7 +296,7 @@ cimport openmp
 @cython.boundscheck(False)
 @cython.wraparound(False)
 cdef void _fused_popcount64_bitwise_and_avx_topk_omp(uint64_t[:] query_packed, uint64_t[:] fingerprints_packed, int64_t[:] topk) nogil:
-    cdef int i
+    cdef int i, i_outside
     cdef int j
     cdef int k = len(topk)
     cdef int64_t count
@@ -321,7 +321,8 @@ cdef void _fused_popcount64_bitwise_and_avx_topk_omp(uint64_t[:] query_packed, u
     cdef __m256i hi
     cdef openmp.omp_lock_t lock
     openmp.omp_init_lock(&lock)
-    for i in prange(fingerprints_packed.shape[0]//(2048//64)):
+    for i_outside in prange(0, fingerprints_packed.shape[0]//(2048//64), 128):
+      for i in range(i_outside, i_outside + 128):
         local = _mm256_setzero_si256()
         fingerprints_packed_curr = &fingerprints_packed[i<<5]
         for j in xrange(0, 32, 4):
